@@ -1,52 +1,63 @@
 #!/bin/bash
-
-# Exit on errors
 set -euo pipefail
 
-# ==============================
-# Colors
-# ==============================
-RED='\033[0;31m'
+BOLD=$(tput bold 2>/dev/null || true)
+NC=$(tput sgr0 2>/dev/null || true)
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
+RED='\033[0;31m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+YELLOW='\033[0;33m'
 
-# ==============================
-# Functions
-# ==============================
-prompt_project_filter() {
-    echo -e "${BLUE}Do you need to search for a specific project keyword? (yes/no)${NC}"
-    read -r answer
-    if [[ "$answer" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
-        echo -e "${YELLOW}Enter the keyword (e.g., 'test', 'prod', etc.):${NC}"
-        read -r keyword
-    else
-        keyword=""
-    fi
+if ! command -v aws &>/dev/null; then
+  echo -e "${RED}AWS CLI not found.${NC}"; exit 1
+fi
+
+if ! aws sts get-caller-identity &>/dev/null; then
+  echo -e "${RED}AWS CLI not configured properly.${NC}"; exit 1
+fi
+
+get_keyword() {
+  echo -e "${BLUE}Do you need to search for a specific project/NAME keyword? (yes/no)${NC}"
+  read -r yn
+  yn=$(echo "$yn" | tr '[:upper:]' '[:lower:]')
+  if [[ "$yn" == "yes" || "$yn" == "y" ]]; then
+    while true; do
+      read -rp "Enter keyword: " keyword
+      [[ -n "$keyword" ]] && echo "$keyword" && return
+      echo -e "${YELLOW}Keyword cannot be empty.${NC}"
+    done
+  else
+    echo ""
+  fi
 }
 
-get_ec2_instances() {
-    echo -e "${GREEN}Fetching EC2 instance list...${NC}"
-    
-    if [[ -n "$keyword" ]]; then
-        echo -e "${BLUE}Filtering EC2 instances by keyword: '${keyword}'${NC}"
-        filter="--filters Name=tag:Name,Values=*${keyword}*"
-    else
-        filter=""
-    fi
-
-    # Run AWS CLI to get EC2 data
-    aws ec2 describe-instances $filter \
-        --query "Reservations[].Instances[].[InstanceId, State.Name, InstanceType, Placement.AvailabilityZone, Tags[?Key=='Name'].Value|[0]]" \
-        --output table
+fetch_instances() {
+  local keyword="$1"
+  local filters=()
+  [[ -n "$keyword" ]] && filters=( --filters "Name=tag:Name,Values=*${keyword}*" )
+  echo -e "\n${GREEN}Fetching EC2 instances...${NC}\n"
+  aws ec2 describe-instances "${filters[@]}" \
+    --query 'Reservations[].Instances[].{ID:InstanceId,Name:(Tags[?Key==`Name`].Value|[0]),State:State.Name,Type:InstanceType,AZ:Placement.AvailabilityZone,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress}' \
+    --output table || { echo -e "${RED}Error fetching instances.${NC}"; exit 1; }
 }
 
-# ==============================
-# Main
-# ==============================
-echo -e "${YELLOW}=== EC2 Finder Script ===${NC}"
-prompt_project_filter
-get_ec2_instances
+validate_results() {
+  local keyword="$1"
+  local filters=()
+  [[ -n "$keyword" ]] && filters=( --filters "Name=tag:Name,Values=*${keyword}*" )
+  result=$(aws ec2 describe-instances "${filters[@]}" --query 'Reservations[].Instances[].InstanceId' --output text || true)
+  if [[ -z "${result//[[:space:]]/}" ]]; then
+    [[ -n "$keyword" ]] && echo -e "${RED}No EC2 instances found matching '${keyword}'.${NC}" || echo -e "${RED}No EC2 instances found.${NC}"
+    exit 0
+  fi
+}
 
-echo -e "\n${GREEN}Done!${NC}"
+echo -e "${BOLD}=== AWS EC2 Finder ===${NC}"
+current_region=$(aws configure get region || echo "not-set")
+echo -e "Current AWS Region: ${YELLOW}${current_region}${NC}\n"
+
+keyword=$(get_keyword)
+validate_results "$keyword"
+fetch_instances "$keyword"
+
+echo -e "\n${GREEN}Done!${NC} ✅"
